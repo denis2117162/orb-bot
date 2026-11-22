@@ -40,6 +40,7 @@ jobs:
           RISK_PER_TRADE: "0.10"
           VIRTUAL_START: "2000"
           VIRTUAL_SINCE: "2026-11-23"
+          MIN_ONE_MULT: "1.5"
           ALPACA_KEY_ID: ${{ secrets.ALPACA_KEY_ID }}
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}

@@ -34,6 +34,8 @@ RISK = float(os.environ.get("RISK_PER_TRADE", "0.01"))
 # plus the realized P&L of this bot's own trades since then. The real paper balance is ignored for sizing.
 VIRTUAL_START = float(os.environ.get("VIRTUAL_START", "0") or 0)
 VIRTUAL_SINCE = os.environ.get("VIRTUAL_SINCE", "")
+# If the budget buys zero contracts but one contract costs at most this multiple of the budget, buy one anyway.
+MIN_ONE_MULT = float(os.environ.get("MIN_ONE_MULT", "1.0") or 1.0)
 MODE = os.environ.get("MODE", "PAPER").upper()
 TRADE = "https://paper-api.alpaca.markets"
 DATA = "https://data.alpaca.markets"
@@ -224,11 +226,16 @@ def enter(plan, equity, d, dry=False):
     bid, ask = option_quote(occ)
     if ask <= 0:
         return {**plan, "skip": f"no quote for {occ}"}
-    qty = math.floor(RISK * equity / (ask * 100))
+    budget = RISK * equity
+    qty = math.floor(budget / (ask * 100))
+    stretched = False
+    if qty < 1 and ask * 100 <= MIN_ONE_MULT * budget:
+        qty, stretched = 1, True
     info = {**plan, "entry_px": px, "target": target, "occ": occ, "bid": bid, "ask": ask, "qty": qty,
-            "premium": qty * ask * 100}
+            "premium": qty * ask * 100, "stretched": stretched}
     if qty < 1:
-        return {**info, "skip": f"{RISK:.0%} of the account (${RISK * equity:,.0f}) buys no contract at ${ask * 100:,.0f}"}
+        return {**info, "skip": f"one contract costs ${ask * 100:,.0f}, more than {MIN_ONE_MULT:.1f}x the "
+                                f"{RISK:.0%} budget (${RISK * equity:,.0f})"}
     if dry:
         return {**info, "dry": True}
     limit = round(ask + 0.02, 2)
@@ -330,7 +337,8 @@ def main(phase):
                 lines.append(f"{p['sym']}: {r['skip']}")
             else:
                 lines.append(f"{p['sym']}: {'CALL' if p['side'] == 1 else 'PUT'} {r['occ']} ask ${r['ask']:.2f} -> "
-                             f"{r['qty']} contracts (${r['premium']:,.0f}); stop {p['stop']:.2f}, target {r['target']:.2f}")
+                             f"{r['qty']} contracts (${r['premium']:,.0f}{', min-1 rule' if r.get('stretched') else ''}); "
+                             f"stop {p['stop']:.2f}, target {r['target']:.2f}")
         tg("\n".join(lines))
         return
 
@@ -376,7 +384,8 @@ def main(phase):
             if t.get("skip"):
                 msg.append(f"{t['sym']}: no trade ({t['skip']})")
             else:
-                msg.append(f"{t['sym']}: BUY {t['qty']} {t['occ']} @ {t['fill']:.2f} (${t['fill'] * 100 * t['qty']:,.0f}); "
+                msg.append(f"{t['sym']}: BUY {t['qty']} {t['occ']} @ {t['fill']:.2f} (${t['fill'] * 100 * t['qty']:,.0f}"
+                           f"{', over budget: min-1-contract rule' if t.get('stretched') else ''}); "
                            f"ETF {t['entry_px']:.2f}, stop {t['stop']:.2f}, target {t['target']:.2f}")
         tg("\n".join(msg))
         hand_off = now().replace(hour=14, minute=30, second=0, microsecond=0)

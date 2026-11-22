@@ -30,6 +30,10 @@ from zoneinfo import ZoneInfo
 ET = ZoneInfo("America/New_York")
 SYMS = ["SPY", "QQQ", "IWM"]
 RISK = float(os.environ.get("RISK_PER_TRADE", "0.01"))
+# Optional virtual account: size trades as if the account held VIRTUAL_START dollars on VIRTUAL_SINCE,
+# plus the realized P&L of this bot's own trades since then. The real paper balance is ignored for sizing.
+VIRTUAL_START = float(os.environ.get("VIRTUAL_START", "0") or 0)
+VIRTUAL_SINCE = os.environ.get("VIRTUAL_SINCE", "")
 MODE = os.environ.get("MODE", "PAPER").upper()
 TRADE = "https://paper-api.alpaca.markets"
 DATA = "https://data.alpaca.markets"
@@ -137,6 +141,28 @@ def account():
     return a
 
 
+def bot_realized_pnl(since: str):
+    """Realized P&L of this bot's filled option orders since `since` (YYYY-MM-DD), in dollars."""
+    st = datetime.fromisoformat(since).replace(tzinfo=ET)
+    total, after = 0.0, st.isoformat()
+    while True:
+        batch = get(TRADE, "/v2/orders", status="closed", after=after, limit=500, direction="asc")
+        for o in batch:
+            if not o.get("client_order_id", "").startswith(TAG + "-") or o.get("status") != "filled":
+                continue
+            amt = float(o["filled_qty"]) * float(o["filled_avg_price"]) * 100
+            total += amt if o["side"] == "sell" else -amt
+        if len(batch) < 500:
+            return total
+        after = batch[-1]["submitted_at"]
+
+
+def sizing_equity(real_equity):
+    if VIRTUAL_START > 0 and VIRTUAL_SINCE:
+        return VIRTUAL_START + bot_realized_pnl(VIRTUAL_SINCE)
+    return real_equity
+
+
 def kill_switch(equity):
     try:
         h = get(TRADE, "/v2/account/portfolio/history", period="1A", timeframe="1D")
@@ -202,7 +228,7 @@ def enter(plan, equity, d, dry=False):
     info = {**plan, "entry_px": px, "target": target, "occ": occ, "bid": bid, "ask": ask, "qty": qty,
             "premium": qty * ask * 100}
     if qty < 1:
-        return {**info, "skip": f"1% of equity (${RISK * equity:,.0f}) buys no contract at ${ask * 100:,.0f}"}
+        return {**info, "skip": f"{RISK:.0%} of the account (${RISK * equity:,.0f}) buys no contract at ${ask * 100:,.0f}"}
     if dry:
         return {**info, "dry": True}
     limit = round(ask + 0.02, 2)
@@ -277,7 +303,12 @@ def main(phase):
     if MODE != "PAPER":
         raise SystemExit("This bot only runs in PAPER mode until the owner approves live trading.")
     a = account()
-    equity = float(a["equity"])
+    real_equity = float(a["equity"])
+    equity = sizing_equity(real_equity)
+    virt = VIRTUAL_START > 0 and VIRTUAL_SINCE
+    if virt:
+        log(f"virtual account: started ${VIRTUAL_START:,.0f} on {VIRTUAL_SINCE}, now ${equity:,.2f} "
+            f"(real paper equity ${real_equity:,.0f})")
     today = now().date()
     clock = get(TRADE, "/v2/clock")
     cal = get(TRADE, "/v2/calendar", start=today.isoformat(), end=today.isoformat())
@@ -287,7 +318,8 @@ def main(phase):
         d = today if is_trading_day else date.fromisoformat(
             get(TRADE, "/v2/calendar", start=(today - timedelta(days=7)).isoformat(), end=today.isoformat())[-1]["date"])
         plans = plan_today(d)
-        lines = [f"MODE: {MODE} | DRY RUN (no orders)", f"Account {a['account_number']} equity ${equity:,.0f}",
+        lines = [f"MODE: {MODE} | DRY RUN (no orders)",
+                 f"Sizing off {'VIRTUAL' if virt else 'real'} equity ${equity:,.2f}, {RISK:.0%} per trade",
                  f"Market open now: {clock['is_open']}. Using first candles from {d}"]
         nxt = date.fromisoformat(clock["next_open"][:10])
         for p in plans:
@@ -321,11 +353,14 @@ def main(phase):
                  if o.get("client_order_id", "").startswith(TAG + "-") and o["side"] == "buy"]
         if prior:
             log("Entries already placed today by another run. Not entering again."); return
-        killed, hwm = kill_switch(equity)
+        killed, hwm = kill_switch(real_equity) if not virt else (False, equity)
+        if virt and equity < 50:
+            tg(f"Virtual account is down to ${equity:,.2f}. No trades. Waiting for the owner."); return
         if killed:
             tg(f"KILL SWITCH: equity ${equity:,.0f} is more than 15% below its high ${hwm:,.0f}. No trades. Waiting for the owner.")
             return
-        tg(f"MODE: {MODE}\nORB bot is up. Equity ${equity:,.0f}. Waiting for the 9:35 ET candle.")
+        tg(f"MODE: {MODE}\nORB bot is up. {'Virtual account' if virt else 'Equity'} ${equity:,.2f}, "
+           f"{RISK:.0%} per trade (${RISK * equity:,.0f}). Waiting for the 9:35 ET candle.")
         sleep_until(now().replace(hour=9, minute=35, second=4, microsecond=0))
         plans = plan_today(today)
         trades = []
@@ -363,8 +398,10 @@ def main(phase):
         manage(trades, exit_t)
         res = close_everything("eod")
         a2 = account()
+        end_eq = sizing_equity(float(a2["equity"]))
         tg("End of day: " + ("; ".join(res) if res else "no positions left at 15:45") +
-           f"\nEquity ${float(a2['equity']):,.0f} (start ${equity:,.0f})")
+           (f"\nVirtual account ${end_eq:,.2f} (started ${VIRTUAL_START:,.0f} on {VIRTUAL_SINCE})" if virt
+            else f"\nEquity ${end_eq:,.0f} (start ${equity:,.0f})"))
         return
 
 

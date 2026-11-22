@@ -37,7 +37,9 @@ jobs:
       - name: Run bot
         env:
           MODE: PAPER
-          RISK_PER_TRADE: "0.01"
+          RISK_PER_TRADE: "0.07"
+          VIRTUAL_START: "2000"
+          VIRTUAL_SINCE: "2026-11-23"
           ALPACA_KEY_ID: ${{ secrets.ALPACA_KEY_ID }}
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}

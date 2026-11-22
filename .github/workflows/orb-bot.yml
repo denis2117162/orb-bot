@@ -1,0 +1,45 @@
+name: ORB options bot (paper)
+
+# Times are UTC. Pacific Standard Time (UTC-8) until 2027-03-14; move each cron one hour earlier then.
+on:
+  schedule:
+    - cron: "47 13 * * 1-5"   # morning: 5:47 a.m. PT, waits for 9:35 ET, manages to 14:30 ET
+    - cron: "17 19 * * 1-5"   # afternoon: 11:17 a.m. PT, manages 14:31-15:45 ET, then closes all
+    - cron: "52 20 * * 1-5"   # backup close: 12:52 p.m. PT (15:52 ET)
+  workflow_dispatch:
+    inputs:
+      phase:
+        description: "dry, morning, afternoon or close"
+        default: "dry"
+
+concurrency:
+  group: orb-${{ github.event.schedule || inputs.phase }}
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Pick phase
+        id: p
+        run: |
+          case "${{ github.event.schedule }}" in
+            "47 13 * * 1-5") echo "phase=morning" >> $GITHUB_OUTPUT ;;
+            "17 19 * * 1-5") echo "phase=afternoon" >> $GITHUB_OUTPUT ;;
+            "52 20 * * 1-5") echo "phase=close" >> $GITHUB_OUTPUT ;;
+            *) echo "phase=${{ inputs.phase }}" >> $GITHUB_OUTPUT ;;
+          esac
+      - name: Run bot
+        env:
+          MODE: PAPER
+          RISK_PER_TRADE: "0.01"
+          ALPACA_KEY_ID: ${{ secrets.ALPACA_KEY_ID }}
+          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python orb_bot.py ${{ steps.p.outputs.phase }}

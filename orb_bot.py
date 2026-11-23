@@ -238,17 +238,36 @@ def enter(plan, equity, d, dry=False):
                                 f"{RISK:.0%} budget (${RISK * equity:,.0f})"}
     if dry:
         return {**info, "dry": True}
-    limit = round(ask + 0.02, 2)
-    cid = f"{TAG}-{sym}-{cp}-s{plan['stop']:.2f}-t{target:.2f}-{int(time.time())}"
-    o = req("POST", TRADE + "/v2/orders", {"symbol": occ, "qty": str(qty), "side": "buy", "type": "limit",
-                                         "limit_price": f"{limit:.2f}", "time_in_force": "day", "client_order_id": cid})
-    o = wait_fill(o["id"], 60)
-    if o["status"] != "filled":
+    # Up to 3 tries, 15 s each: re-quote and re-price, never paying more than 10% over the first quote.
+    cap = round(ask * 1.10 + 0.05, 2)
+    o, tries, last_limit = None, 0, None
+    for tries in range(1, 4):
+        if tries > 1:
+            _, ask_now = option_quote(occ)
+            ask = max(ask, ask_now) if ask_now > 0 else ask
+        limit = min(round(ask * 1.02 + 0.03, 2), cap)
+        if last_limit is not None and limit <= last_limit:
+            limit = min(round(last_limit + 0.05, 2), cap)
+        last_limit = limit
+        cid = f"{TAG}-{sym}-{cp}-s{plan['stop']:.2f}-t{target:.2f}-{int(time.time())}"
+        o = req("POST", TRADE + "/v2/orders", {"symbol": occ, "qty": str(qty), "side": "buy", "type": "limit",
+                                             "limit_price": f"{limit:.2f}", "time_in_force": "day", "client_order_id": cid})
+        o = wait_fill(o["id"], 15)
+        if o["status"] == "filled":
+            break
         try:
             req("DELETE", TRADE + f"/v2/orders/{o['id']}")
         except Exception:
             pass
-        return {**info, "skip": f"buy not filled in 60s (status {o['status']}), canceled"}
+        time.sleep(1)
+        o = get(TRADE, f"/v2/orders/{o['id']}")
+        if o["status"] == "filled":  # filled while canceling
+            break
+        if limit >= cap:
+            break
+    info["tries"] = tries
+    if o is None or o["status"] != "filled":
+        return {**info, "skip": f"buy not filled after {tries} tries (last limit ${last_limit:.2f}, cap ${cap:.2f}); canceled"}
     info["fill"] = float(o["filled_avg_price"]); info["qty"] = int(float(o["filled_qty"]))
     return info
 

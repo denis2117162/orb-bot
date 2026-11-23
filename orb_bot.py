@@ -321,6 +321,24 @@ def main(phase):
     cal = get(TRADE, "/v2/calendar", start=today.isoformat(), end=today.isoformat())
     is_trading_day = bool(cal) and cal[0]["date"] == today.isoformat()
 
+    if phase == "status":
+        d0 = now().replace(hour=0, minute=0, second=0, microsecond=0)
+        orders = get(TRADE, "/v2/orders", status="all", after=d0.isoformat(), limit=200, direction="asc")
+        for o in orders:
+            log(f"ORDER {o['symbol']} {o['side']} {o['type']} qty {o['qty']} limit {o.get('limit_price')} "
+                f"status {o['status']} filled {o.get('filled_qty')} @ {o.get('filled_avg_price')} "
+                f"submitted {o.get('submitted_at')} canceled {o.get('canceled_at')} cid {o.get('client_order_id')}")
+        for p in option_positions():
+            log(f"POSITION {p['symbol']} qty {p['qty']} avg {p['avg_entry_price']} now {p.get('current_price')} "
+                f"P&L {p.get('unrealized_pl')}")
+        for occ in sorted({o['symbol'] for o in orders}):
+            try:
+                b, a_ = option_quote(occ)
+                log(f"QUOTE now {occ} bid {b} ask {a_}")
+            except Exception as e:
+                log(f"quote error {occ}: {e}")
+        return
+
     if phase == "dry":
         d = today if is_trading_day else date.fromisoformat(
             get(TRADE, "/v2/calendar", start=(today - timedelta(days=7)).isoformat(), end=today.isoformat())[-1]["date"])

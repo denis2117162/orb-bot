@@ -347,9 +347,15 @@ def main(phase):
             log(f"ORDER {o['symbol']} {o['side']} {o['type']} qty {o['qty']} limit {o.get('limit_price')} "
                 f"status {o['status']} filled {o.get('filled_qty')} @ {o.get('filled_avg_price')} "
                 f"submitted {o.get('submitted_at')} canceled {o.get('canceled_at')} cid {o.get('client_order_id')}")
+        px = last_price(SYMS)
         for p in option_positions():
             log(f"POSITION {p['symbol']} qty {p['qty']} avg {p['avg_entry_price']} now {p.get('current_price')} "
                 f"P&L {p.get('unrealized_pl')}")
+        for o in orders:
+            cid = o.get("client_order_id", "")
+            if cid.startswith(TAG + "-") and o["side"] == "buy" and o["status"] == "filled":
+                _, sym, cp, st, tt, _ = cid.split("-")
+                log(f"LEVELS {sym} {cp}: ETF now {px.get(sym)} stop {st[1:]} target {tt[1:]}")
         for occ in sorted({o['symbol'] for o in orders}):
             try:
                 b, a_ = option_quote(occ)

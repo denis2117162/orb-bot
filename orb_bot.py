@@ -273,6 +273,15 @@ def enter(plan, equity, d, dry=False):
 
 
 def manage(trades, until: datetime):
+    try:
+        return _manage(trades, until)
+    except Exception as e:
+        tg(f"Manager error: {e}. Restarting the watch loop.")
+        time.sleep(5)
+        return _manage(trades, until)
+
+
+def _manage(trades, until: datetime):
     """Watch the ETFs every 10 s; exit on stop or target. Returns trades still open at `until`."""
     open_t = [t for t in trades if "fill" in t and "exit" not in t]
     while open_t and now() < until:
@@ -287,7 +296,12 @@ def manage(trades, until: datetime):
             s = t["side"]
             why = "stop" if s * (p - t["stop"]) <= 0 else "target" if s * (p - t["target"]) >= 0 else None
             if why:
-                o = sell_all(t["occ"], t["qty"], why)
+                try:
+                    o = sell_all(t["occ"], t["qty"], why)
+                except Exception as e:  # keep watching; retry on the next loop
+                    log(f"sell error {t['occ']}: {e}")
+                    tg(f"SELL FAILED {t['sym']} {t['occ']} ({why}): {e}. Retrying in 10 s.")
+                    continue
                 t["exit"] = float(o.get("filled_avg_price") or 0); t["why"] = why
                 pnl = (t["exit"] - t["fill"]) * 100 * t["qty"]
                 tg(f"EXIT {t['sym']} {t['occ']} ({why} at {p:.2f})\nsold {t['qty']} @ {t['exit']:.2f}, "

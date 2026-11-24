@@ -299,7 +299,8 @@ def _manage(trades, until: datetime):
             s = t["side"]
             why = "stop" if s * (p - t["stop"]) <= 0 else "target" if s * (p - t["target"]) >= 0 else None
             if why is None and TIME_STOP_MIN and t.get("entry_time") and not t.get("time_checked") \
-                    and now() >= t["entry_time"] + timedelta(minutes=TIME_STOP_MIN):
+                    and t["entry_time"] + timedelta(minutes=TIME_STOP_MIN) <= now() \
+                    <= t["entry_time"] + timedelta(minutes=TIME_STOP_MIN + 10):
                 t["time_checked"] = True
                 try:
                     bid, ask = option_quote(t["occ"])
@@ -424,6 +425,59 @@ def main(phase):
 
     close_t = datetime.combine(today, datetime.strptime(cal[0]["close"], "%H:%M").time(), ET) if is_trading_day else None
     exit_t = close_t - timedelta(minutes=15) if close_t else None
+
+    if phase == "auto":
+        budget_end = now() + timedelta(minutes=335)  # stay under GitHub's 6-hour job limit
+        nine45 = now().replace(hour=9, minute=45, second=0, microsecond=0)
+        d0 = now().replace(hour=0, minute=0, second=0, microsecond=0)
+        entered = [o for o in get(TRADE, "/v2/orders", status="all", after=d0.isoformat(), limit=200)
+                   if o.get("client_order_id", "").startswith(TAG + "-") and o["side"] == "buy"]
+        if not entered and now() < nine45:
+            killed, hwm = kill_switch(real_equity) if not virt else (False, equity)
+            if virt and equity < 50:
+                tg(f"Virtual account is down to ${equity:,.2f}. No trades. Waiting for the owner."); return
+            if killed:
+                tg(f"KILL SWITCH: equity ${equity:,.0f} is more than 15% below its high ${hwm:,.0f}. No trades."); return
+            tg(f"MODE: {MODE}\nORB bot is up. {'Virtual account' if virt else 'Equity'} ${equity:,.2f}, "
+               f"{RISK:.0%} per trade (${RISK * equity:,.0f}). Waiting for the 9:35 ET candle.")
+            sleep_until(now().replace(hour=9, minute=35, second=4, microsecond=0))
+            # another run may have entered while this one waited in line
+            again = [o for o in get(TRADE, "/v2/orders", status="all", after=d0.isoformat(), limit=200)
+                     if o.get("client_order_id", "").startswith(TAG + "-") and o["side"] == "buy"]
+            if not again:
+                trades = []
+                for p in plan_today(today):
+                    if p.get("skip"):
+                        trades.append(p); continue
+                    try:
+                        trades.append(enter(p, equity, today))
+                    except Exception as e:
+                        trades.append({**p, "skip": f"error: {e}"})
+                msg = ["9:35 ET entries:"]
+                for t in trades:
+                    if t.get("skip"):
+                        msg.append(f"{t['sym']}: no trade ({t['skip']})")
+                    else:
+                        msg.append(f"{t['sym']}: BUY {t['qty']} {t['occ']} @ {t['fill']:.2f} (${t['fill'] * 100 * t['qty']:,.0f}"
+                                   f"{', over budget: min-1-contract rule' if t.get('stretched') else ''}); "
+                                   f"ETF {t['entry_px']:.2f}, stop {t['stop']:.2f}, target {t['target']:.2f}")
+                tg("\n".join(msg))
+        elif not entered and now() >= nine45 and now() < exit_t:
+            log("No entries today and it is past 9:45 ET. Nothing to trade.")
+        trades = rebuild_open()
+        if trades:
+            log(f"managing {len(trades)} open position(s) until {min(exit_t, budget_end):%H:%M} ET")
+            manage(trades, min(exit_t, budget_end))
+        if now() >= exit_t - timedelta(minutes=1) or (not rebuild_open() and now() >= exit_t - timedelta(minutes=30)):
+            res = close_everything("eod")
+            if entered or res:
+                end_eq = sizing_equity(float(account()["equity"]))
+                tg("End of day: " + ("; ".join(res) if res else "nothing left open") +
+                   (f"\nVirtual account ${end_eq:,.2f} (started ${VIRTUAL_START:,.0f} on {VIRTUAL_SINCE})" if virt
+                    else f"\nEquity ${end_eq:,.0f}"))
+        elif rebuild_open():
+            log("Time budget used; the next scheduled run takes over.")
+        return
 
     if phase == "morning":
         if now() > now().replace(hour=9, minute=45, second=0, microsecond=0):

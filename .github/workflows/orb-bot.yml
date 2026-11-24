@@ -1,20 +1,35 @@
 name: ORB options bot (paper)
 
-# Times are UTC. Pacific Standard Time (UTC-8) until 2027-03-14; move each cron one hour earlier then.
+# Times are UTC for Pacific/Eastern STANDARD time; move every cron one hour earlier on 2027-03-14.
+# Many start attempts on purpose: GitHub's scheduler can run late or skip. Each run is the same "auto" job:
+# the first to start waits for 9:35 ET and enters; later ones queue behind it (one trading run at a time) and
+# take over managing positions; the run that reaches 15:45 ET closes everything.
 on:
   schedule:
-    - cron: "47 13 * * 1-5"   # morning: 5:47 a.m. PT, waits for 9:35 ET, manages to 14:30 ET
-    - cron: "17 19 * * 1-5"   # afternoon: 11:17 a.m. PT, manages 14:31-15:45 ET, then closes all
-    - cron: "52 20 * * 1-5"   # backup close: 12:52 p.m. PT (15:52 ET)
+    - cron: "7 12 * * 1-5"
+    - cron: "37 12 * * 1-5"
+    - cron: "7 13 * * 1-5"
+    - cron: "37 13 * * 1-5"
+    - cron: "7 14 * * 1-5"
+    - cron: "7 16 * * 1-5"
+    - cron: "37 16 * * 1-5"
+    - cron: "7 17 * * 1-5"
+    - cron: "37 17 * * 1-5"
+    - cron: "7 18 * * 1-5"
+    - cron: "37 18 * * 1-5"
+    - cron: "7 19 * * 1-5"
+    - cron: "37 19 * * 1-5"
+    - cron: "7 20 * * 1-5"
+    - cron: "37 20 * * 1-5"
   workflow_dispatch:
     inputs:
       phase:
-        description: "dry, morning, afternoon or close"
+        description: "auto, dry, status, morning, afternoon or close"
         default: "dry"
 
 # One trading run at a time (morning, afternoon, close share a lock); status/dry runs are separate.
 concurrency:
-  group: ${{ (github.event_name == 'schedule' || contains('morning afternoon close', inputs.phase)) && 'orb-trading' || format('orb-{0}', inputs.phase) }}
+  group: ${{ (github.event_name == 'schedule' || contains('auto morning afternoon close', inputs.phase)) && 'orb-trading' || format('orb-{0}', inputs.phase) }}
   cancel-in-progress: false
 
 jobs:
@@ -29,18 +44,14 @@ jobs:
       - name: Pick phase
         id: p
         run: |
-          case "${{ github.event.schedule }}" in
-            "47 13 * * 1-5") echo "phase=morning" >> $GITHUB_OUTPUT ;;
-            "17 19 * * 1-5") echo "phase=afternoon" >> $GITHUB_OUTPUT ;;
-            "52 20 * * 1-5") echo "phase=close" >> $GITHUB_OUTPUT ;;
-            *) echo "phase=${{ inputs.phase }}" >> $GITHUB_OUTPUT ;;
-          esac
+          if [ "${{ github.event_name }}" = "schedule" ]; then echo "phase=auto" >> $GITHUB_OUTPUT;
+          else echo "phase=${{ inputs.phase }}" >> $GITHUB_OUTPUT; fi
       - name: Run bot
         env:
           MODE: PAPER
           RISK_PER_TRADE: "0.10"
           VIRTUAL_START: "2000"
-          VIRTUAL_SINCE: "2026-11-23"
+          VIRTUAL_SINCE: "2026-11-24"
           MIN_ONE_MULT: "1.5"
           TIME_STOP_MIN: "90"
           ALPACA_KEY_ID: ${{ secrets.ALPACA_KEY_ID }}

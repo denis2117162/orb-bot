@@ -36,6 +36,8 @@ VIRTUAL_START = float(os.environ.get("VIRTUAL_START", "0") or 0)
 VIRTUAL_SINCE = os.environ.get("VIRTUAL_SINCE", "")
 # If the budget buys zero contracts but one contract costs at most this multiple of the budget, buy one anyway.
 MIN_ONE_MULT = float(os.environ.get("MIN_ONE_MULT", "1.0") or 1.0)
+# Premium-decay time stop: if the option is still below its fill price this many minutes after entry, sell.
+TIME_STOP_MIN = float(os.environ.get("TIME_STOP_MIN", "90") or 0)
 MODE = os.environ.get("MODE", "PAPER").upper()
 TRADE = "https://paper-api.alpaca.markets"
 DATA = "https://data.alpaca.markets"
@@ -269,6 +271,7 @@ def enter(plan, equity, d, dry=False):
     if o is None or o["status"] != "filled":
         return {**info, "skip": f"buy not filled after {tries} tries (last limit ${last_limit:.2f}, cap ${cap:.2f}); canceled"}
     info["fill"] = float(o["filled_avg_price"]); info["qty"] = int(float(o["filled_qty"]))
+    info["entry_time"] = datetime.fromisoformat(o["filled_at"].replace("Z", "+00:00")).astimezone(ET)
     return info
 
 
@@ -295,9 +298,20 @@ def _manage(trades, until: datetime):
                 continue
             s = t["side"]
             why = "stop" if s * (p - t["stop"]) <= 0 else "target" if s * (p - t["target"]) >= 0 else None
+            if why is None and TIME_STOP_MIN and t.get("entry_time") and not t.get("time_checked") \
+                    and now() >= t["entry_time"] + timedelta(minutes=TIME_STOP_MIN):
+                t["time_checked"] = True
+                try:
+                    bid, ask = option_quote(t["occ"])
+                    mid = (bid + ask) / 2 if bid > 0 and ask > 0 else bid
+                    if mid < t["fill"]:
+                        why = "time stop"
+                        log(f"{t['occ']}: {TIME_STOP_MIN:.0f} min after entry, worth {mid:.2f} < paid {t['fill']:.2f}")
+                except Exception as e:
+                    log(f"time-stop quote error {t['occ']}: {e}")
             if why:
                 try:
-                    o = sell_all(t["occ"], t["qty"], why)
+                    o = sell_all(t["occ"], t["qty"], why.replace(" ", ""))
                 except Exception as e:  # keep watching; retry on the next loop
                     log(f"sell error {t['occ']}: {e}")
                     tg(f"SELL FAILED {t['sym']} {t['occ']} ({why}): {e}. Retrying in 10 s.")
@@ -323,7 +337,8 @@ def rebuild_open():
             continue
         _, sym, cp, s, tt, _ = cid.split("-")
         out.append({"sym": sym, "side": 1 if cp == "C" else -1, "stop": float(s[1:]), "target": float(tt[1:]),
-                    "occ": o["symbol"], "qty": int(float(pos[o["symbol"]]["qty"])), "fill": float(o["filled_avg_price"])})
+                    "occ": o["symbol"], "qty": int(float(pos[o["symbol"]]["qty"])), "fill": float(o["filled_avg_price"]),
+                    "entry_time": datetime.fromisoformat(o["filled_at"].replace("Z", "+00:00")).astimezone(ET)})
     return out
 
 

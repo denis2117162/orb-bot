@@ -12,8 +12,9 @@ on:
         description: "dry, morning, afternoon or close"
         default: "dry"
 
+# One trading run at a time (morning, afternoon, close share a lock); status/dry runs are separate.
 concurrency:
-  group: orb-${{ github.event.schedule || inputs.phase }}
+  group: ${{ (github.event_name == 'schedule' || contains('morning afternoon close', inputs.phase)) && 'orb-trading' || format('orb-{0}', inputs.phase) }}
   cancel-in-progress: false
 
 jobs:
@@ -37,10 +38,11 @@ jobs:
       - name: Run bot
         env:
           MODE: PAPER
-          RISK_PER_TRADE: "0.20"
+          RISK_PER_TRADE: "0.10"
           VIRTUAL_START: "2000"
           VIRTUAL_SINCE: "2026-11-23"
-          MIN_ONE_MULT: "5"
+          MIN_ONE_MULT: "1.5"
+          TIME_STOP_MIN: "90"
           ALPACA_KEY_ID: ${{ secrets.ALPACA_KEY_ID }}
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}

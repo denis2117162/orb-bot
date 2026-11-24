@@ -254,18 +254,21 @@ def plan_today(d: date, dry=False):
     return plans
 
 
-def enter(plan, equity, d, dry=False):
+def enter(plan, equity, d, dry=False, px=None):
     sym, side = plan["sym"], plan["side"]
-    px = last_price([sym])[sym]
+    px = px if px is not None else last_price([sym])[sym]
     risk = side * (px - plan["stop"])
     if risk <= 0:
         return {**plan, "skip": f"price {px:.2f} already beyond the stop {plan['stop']:.2f}"}
     target = px + side * 10 * risk
     cp = "C" if side == 1 else "P"
-    c = pick_contract(sym, cp, px, d)
-    if not c:
-        return {**plan, "skip": "no contract found"}
-    occ = c["symbol"]
+    if plan.get("occ"):
+        occ = plan["occ"]
+    else:
+        c = pick_contract(sym, cp, px, d)
+        if not c:
+            return {**plan, "skip": "no contract found"}
+        occ = c["symbol"]
     bid, ask = option_quote(occ)
     if ask <= 0:
         return {**plan, "skip": f"no quote for {occ}"}
@@ -326,45 +329,101 @@ def manage(trades, until: datetime):
 
 
 def _manage(trades, until: datetime):
-    """Watch the ETFs every 10 s; exit on stop or target. Returns trades still open at `until`."""
     open_t = [t for t in trades if "fill" in t and "exit" not in t]
     while open_t and now() < until:
-        try:
-            px = last_price([t["sym"] for t in open_t])
-        except Exception as e:
-            log(f"price error: {e}"); time.sleep(10); continue
-        for t in open_t:
-            p = px.get(t["sym"])
-            if p is None:
-                continue
-            s = t["side"]
-            why = "stop" if s * (p - t["stop"]) <= 0 else "target" if s * (p - t["target"]) >= 0 else None
-            if why is None and TIME_STOP_MIN and t.get("entry_time") and not t.get("time_checked") \
-                    and t["entry_time"] + timedelta(minutes=TIME_STOP_MIN) <= now() \
-                    <= t["entry_time"] + timedelta(minutes=TIME_STOP_MIN + 10):
-                t["time_checked"] = True
-                try:
-                    bid, ask = option_quote(t["occ"])
-                    mid = (bid + ask) / 2 if bid > 0 and ask > 0 else bid
-                    if mid < t["fill"]:
-                        why = "time stop"
-                        log(f"{t['occ']}: {TIME_STOP_MIN:.0f} min after entry, worth {mid:.2f} < paid {t['fill']:.2f}")
-                except Exception as e:
-                    log(f"time-stop quote error {t['occ']}: {e}")
-            if why:
-                try:
-                    o = sell_all(t["occ"], t["qty"], why.replace(" ", ""))
-                except Exception as e:  # keep watching; retry on the next loop
-                    log(f"sell error {t['occ']}: {e}")
-                    tg(f"SELL FAILED {t['sym']} {t['occ']} ({why}): {e}. Retrying in 10 s.")
-                    continue
-                t["exit"] = float(o.get("filled_avg_price") or 0); t["why"] = why
-                pnl = (t["exit"] - t["fill"]) * 100 * t["qty"]
-                tg(f"EXIT {t['sym']} {t['occ']} ({why} at {p:.2f})\nsold {t['qty']} @ {t['exit']:.2f}, "
-                   f"bought @ {t['fill']:.2f}\nP&L ${pnl:,.0f} ({(t['exit'] / t['fill'] - 1):+.0%})")
+        manage_step(open_t)
         open_t = [t for t in open_t if "exit" not in t]
         time.sleep(10)
     return open_t
+
+
+def manage_step(open_t):
+    """One pass: check stop, target and the time stop for each open trade."""
+    if not open_t:
+        return
+    try:
+        px = last_price([t["sym"] for t in open_t])
+    except Exception as e:
+        log(f"price error: {e}"); return
+    for t in open_t:
+        p = px.get(t["sym"])
+        if p is None or "exit" in t:
+            continue
+        s = t["side"]
+        why = "stop" if s * (p - t["stop"]) <= 0 else "target" if s * (p - t["target"]) >= 0 else None
+        if why is None and TIME_STOP_MIN and t.get("entry_time") and not t.get("time_checked") \
+                and t["entry_time"] + timedelta(minutes=TIME_STOP_MIN) <= now() \
+                <= t["entry_time"] + timedelta(minutes=TIME_STOP_MIN + 10):
+            t["time_checked"] = True
+            try:
+                bid, ask = option_quote(t["occ"])
+                mid = (bid + ask) / 2 if bid > 0 and ask > 0 else bid
+                if mid < t["fill"]:
+                    why = "time stop"
+                    log(f"{t['occ']}: {TIME_STOP_MIN:.0f} min after entry, worth {mid:.2f} < paid {t['fill']:.2f}")
+            except Exception as e:
+                log(f"time-stop quote error {t['occ']}: {e}")
+        if why:
+            try:
+                o = sell_all(t["occ"], t["qty"], why.replace(" ", ""))
+            except Exception as e:
+                log(f"sell error {t['occ']}: {e}")
+                tg(f"SELL FAILED {t['sym']} {t['occ']} ({why}): {e}. Retrying in 10 s.")
+                continue
+            t["exit"] = float(o.get("filled_avg_price") or 0); t["why"] = why
+            pnl = (t["exit"] - t["fill"]) * 100 * t["qty"]
+            tg(f"EXIT {t['sym']} {t['occ']} ({why} at {p:.2f})\nsold {t['qty']} @ {t['exit']:.2f}, "
+               f"bought @ {t['fill']:.2f}\nP&L ${pnl:,.0f} ({(t['exit'] / t['fill'] - 1):+.0%})")
+
+
+def breakout_entries(today, equity):
+    """Arm each ETF at 9:35 (direction, stop, contract), then buy only if the ETF trades beyond the first
+    candle's high (calls) or low (puts) before 10:30 ET. Open trades are managed during the wait."""
+    armed, msg = [], ["9:35 ET first candles (waiting for a breakout until 10:30 ET):"]
+    for p in plan_today(today):
+        if p.get("skip"):
+            msg.append(f"{p['sym']}: no trade ({p['skip']})"); continue
+        b = p["candle"]
+        p["level"] = b["h"] if p["side"] == 1 else b["l"]
+        cp = "C" if p["side"] == 1 else "P"
+        try:
+            c = pick_contract(p["sym"], cp, float(b["c"]), today)
+            p["occ"] = c["symbol"] if c else None
+        except Exception as e:
+            p["occ"] = None; log(f"contract error {p['sym']}: {e}")
+        if not p["occ"]:
+            msg.append(f"{p['sym']}: no contract found"); continue
+        armed.append(p)
+        msg.append(f"{p['sym']}: {'CALL' if p['side'] == 1 else 'PUT'} {p['occ']} if it trades "
+                   f"{'above' if p['side'] == 1 else 'below'} {p['level']:.2f} (stop {p['stop']:.2f})")
+    tg("\n".join(msg))
+    entered = []
+    deadline = now().replace(hour=10, minute=30, second=0, microsecond=0)
+    while armed and now() < deadline:
+        try:
+            px = last_price([p["sym"] for p in armed])
+        except Exception as e:
+            log(f"price error: {e}"); time.sleep(5); continue
+        for p in list(armed):
+            q = px.get(p["sym"])
+            if q is None or p["side"] * (q - p["level"]) <= 0:
+                continue
+            armed.remove(p)
+            try:
+                t = enter(p, equity, today, px=q)
+            except Exception as e:
+                t = {**p, "skip": f"error: {e}"}
+            if t.get("skip"):
+                tg(f"{p['sym']} broke out at {q:.2f} but no trade: {t['skip']}")
+            else:
+                entered.append(t)
+                tg(f"ENTRY {t['sym']} breakout at {q:.2f}: BUY {t['qty']} {t['occ']} @ {t['fill']:.2f} "
+                   f"(${t['fill'] * 100 * t['qty']:,.0f}{', min-1-contract rule' if t.get('stretched') else ''}); "
+                   f"stop {t['stop']:.2f}, target {t['target']:.2f}")
+        manage_step([t for t in entered if "exit" not in t])
+        time.sleep(5)
+    if armed:
+        tg("No breakout by 10:30 ET, no trade: " + ", ".join(p["sym"] for p in armed))
 
 
 def rebuild_open():
@@ -486,23 +545,7 @@ def main(phase):
             again = [o for o in get(TRADE, "/v2/orders", status="all", after=d0.isoformat(), limit=200)
                      if o.get("client_order_id", "").startswith(TAG + "-") and o["side"] == "buy"]
             if not again:
-                trades = []
-                for p in plan_today(today):
-                    if p.get("skip"):
-                        trades.append(p); continue
-                    try:
-                        trades.append(enter(p, equity, today))
-                    except Exception as e:
-                        trades.append({**p, "skip": f"error: {e}"})
-                msg = ["9:35 ET entries:"]
-                for t in trades:
-                    if t.get("skip"):
-                        msg.append(f"{t['sym']}: no trade ({t['skip']})")
-                    else:
-                        msg.append(f"{t['sym']}: BUY {t['qty']} {t['occ']} @ {t['fill']:.2f} (${t['fill'] * 100 * t['qty']:,.0f}"
-                                   f"{', over budget: min-1-contract rule' if t.get('stretched') else ''}); "
-                                   f"ETF {t['entry_px']:.2f}, stop {t['stop']:.2f}, target {t['target']:.2f}")
-                tg("\n".join(msg))
+                breakout_entries(today, equity)
         elif not entered and now() >= nine45 and now() < exit_t:
             log("No entries today and it is past 9:45 ET. Nothing to trade.")
         trades = rebuild_open()

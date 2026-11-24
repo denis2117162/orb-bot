@@ -49,9 +49,11 @@ jobs:
       - name: Run bot
         env:
           MODE: PAPER
-          RISK_PER_TRADE: "0.10"
-          VIRTUAL_START: "2000"
-          VIRTUAL_SINCE: "2026-11-24"
+          RISK_PER_TRADE: "0.01"
+          VIRTUAL_START: "0"
+          VIRTUAL_SINCE: ""
+          SHADOW_START: "2000"
+          SHADOW_SINCE: "2026-11-25"
           MIN_ONE_MULT: "1.5"
           TIME_STOP_MIN: "90"
           ALPACA_KEY_ID: ${{ secrets.ALPACA_KEY_ID }}

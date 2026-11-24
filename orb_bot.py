@@ -161,10 +161,51 @@ def bot_realized_pnl(since: str):
         after = batch[-1]["submitted_at"]
 
 
+SHADOW_START = float(os.environ.get("SHADOW_START", "0") or 0)
+SHADOW_SINCE = os.environ.get("SHADOW_SINCE", "")
+SHADOW_RISK = float(os.environ.get("SHADOW_RISK", "0.10"))
+SHADOW_MIN_ONE = float(os.environ.get("SHADOW_MIN_ONE", "1.5"))
+
+
+def shadow_replay():
+    """Replay this bot's real fills through small-account rules: each trade's % return applied to what the
+    small account could have bought (floor(budget / cost), or 1 contract if it costs <= SHADOW_MIN_ONE x budget)."""
+    if not (SHADOW_START and SHADOW_SINCE):
+        return None
+    st = datetime.fromisoformat(SHADOW_SINCE).replace(tzinfo=ET)
+    orders = [o for o in get(TRADE, "/v2/orders", status="closed", after=st.isoformat(), limit=500, direction="asc")
+              if o.get("client_order_id", "").startswith(TAG + "-") and o.get("status") == "filled"]
+    buys = {}
+    eq, n, skipped = SHADOW_START, 0, 0
+    for o in orders:
+        px = float(o["filled_avg_price"])
+        if o["side"] == "buy":
+            buys[o["symbol"]] = px
+        elif o["symbol"] in buys:
+            b = buys.pop(o["symbol"]); cost = b * 100; budget = SHADOW_RISK * eq
+            q = math.floor(budget / cost) or (1 if cost <= SHADOW_MIN_ONE * budget else 0)
+            if q == 0:
+                skipped += 1; continue
+            eq += q * cost * (px / b - 1); n += 1
+    return eq, n, skipped
+
+
 def sizing_equity(real_equity):
     if VIRTUAL_START > 0 and VIRTUAL_SINCE:
         return VIRTUAL_START + bot_realized_pnl(VIRTUAL_SINCE)
     return real_equity
+
+
+def shadow_line():
+    try:
+        r = shadow_replay()
+    except Exception as e:
+        return f"\n$2k replay error: {e}"
+    if not r:
+        return ""
+    eq, n, sk = r
+    return (f"\n$2k replay (same fills, {SHADOW_RISK:.0%} per trade, 1 contract up to {SHADOW_MIN_ONE}x budget): "
+            f"${eq:,.2f} from ${SHADOW_START:,.0f} since {SHADOW_SINCE} ({n} trades taken, {sk} too expensive)")
 
 
 def kill_switch(equity):
@@ -474,7 +515,7 @@ def main(phase):
                 end_eq = sizing_equity(float(account()["equity"]))
                 tg("End of day: " + ("; ".join(res) if res else "nothing left open") +
                    (f"\nVirtual account ${end_eq:,.2f} (started ${VIRTUAL_START:,.0f} on {VIRTUAL_SINCE})" if virt
-                    else f"\nEquity ${end_eq:,.0f}"))
+                    else f"\nPaper equity ${end_eq:,.0f}") + shadow_line())
         elif rebuild_open():
             log("Time budget used; the next scheduled run takes over.")
         return

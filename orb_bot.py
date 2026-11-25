@@ -10,7 +10,7 @@ Rules (playbook, paper only until the owner approves live trading):
 - First 5-minute candle (9:30-9:35 ET, IEX feed) closed up -> buy a call; down -> buy a put; flat -> no trade.
 - Strike nearest the price, expiry today (next listed expiry if none today).
 - Premium paid = RISK_PER_TRADE of the sizing equity (virtual $10k at 3% from 2026-11-27, ETFs only).
-- Premarket high/low is noted on each trade (tracking only, not a rule).
+- Premarket high/low, prior-day and 5-day high/low, and VIX are noted on each trade (tracking only, not rules).
 - Exit when the ETF hits the stop (far end of the first candle) or 10x the stop distance, else at 15:45 ET.
 - Kill switch: equity 15% below its high -> no new trades, alert.
 Keys come only from environment variables. Never printed.
@@ -149,6 +149,40 @@ def premarket_levels(sym, d: date):
         except Exception as e:
             log(f"premarket {sym} {feed}: {e}")
     return (max(hs), min(ls)) if hs else (None, None)
+
+
+def recent_levels(sym, d: date):
+    """Prior-day and 5-day high/low from daily SIP bars ending yesterday (free: older than 15 min). Note only."""
+    try:
+        js = get(DATA, "/v2/stocks/bars", symbols=sym, timeframe="1Day", feed="sip", adjustment="split",
+                 start=(d - timedelta(days=14)).isoformat(), end=d.isoformat(), limit=20)
+        b = [x for x in (js.get("bars") or {}).get(sym) or [] if x["t"][:10] < d.isoformat()][-5:]
+        if not b:
+            return {}
+        return {"pdh": b[-1]["h"], "pdl": b[-1]["l"], "h5": max(x["h"] for x in b), "l5": min(x["l"] for x in b)}
+    except Exception as e:
+        log(f"recent levels {sym}: {e}"); return {}
+
+
+def vix_close():
+    """Last VIX close from Cboe's free public daily file (note only)."""
+    try:
+        with urllib.request.urlopen("https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX_History.csv",
+                                    timeout=20) as r:
+            last = r.read().decode().strip().splitlines()[-1].split(",")
+        return last[0], float(last[4])
+    except Exception as e:
+        log(f"VIX: {e}"); return None, None
+
+
+def level_note(p, q):
+    """Where the entry sits vs yesterday's and the 5-day high/low, in the trade's direction. Tracking only."""
+    r = p.get("recent") or {}
+    if not r:
+        return "recent levels n/a"
+    if p["side"] == 1:
+        return f"vs prior-day high {r['pdh']:.2f} {'past' if q > r['pdh'] else 'below'}, 5-day high {r['h5']:.2f}"
+    return f"vs prior-day low {r['pdl']:.2f} {'past' if q < r['pdl'] else 'above'}, 5-day low {r['l5']:.2f}"
 
 
 def pm_note(p, q):
@@ -451,13 +485,16 @@ def manage_step(open_t):
 def breakout_entries(today, equity):
     """Arm each ETF at 9:35 (direction, stop, contract), then buy only if the ETF trades beyond the first
     candle's high (calls) or low (puts) before 10:30 ET. Open trades are managed during the wait."""
-    armed, msg = [], ["9:35 ET first candles (waiting for a breakout until 10:30 ET):"]
+    vd, vx = vix_close()
+    armed, msg = [], ["9:35 ET first candles (waiting for a breakout until 10:30 ET):"
+                      + (f"\nVIX last close {vx:.2f} ({vd})" if vx else "")]
     for p in plan_today(today):
         if p.get("skip"):
             msg.append(f"{label(p['sym'])}: no trade ({p['skip']})"); continue
         b = p["candle"]
         p["level"] = b["h"] if p["side"] == 1 else b["l"]
         p["pmh"], p["pml"] = premarket_levels(p["sym"], today)
+        p["recent"] = recent_levels(p["sym"], today)
         cp = "C" if p["side"] == 1 else "P"
         try:
             c = pick_contract(p["sym"], cp, float(b["c"]), today)
@@ -469,7 +506,9 @@ def breakout_entries(today, equity):
         armed.append(p)
         msg.append(f"{label(p['sym'])}: {'CALL' if p['side'] == 1 else 'PUT'} {p['occ']} if it trades "
                    f"{'above' if p['side'] == 1 else 'below'} {p['level']:.2f} (stop {p['stop']:.2f}; "
-                   f"PM high {p['pmh'] or 0:.2f} / low {p['pml'] or 0:.2f})")
+                   f"PM high {p['pmh'] or 0:.2f} / low {p['pml'] or 0:.2f}; "
+                   f"prior day {p['recent'].get('pdh', 0):.2f} / {p['recent'].get('pdl', 0):.2f}; "
+                   f"5-day {p['recent'].get('h5', 0):.2f} / {p['recent'].get('l5', 0):.2f})")
     tg("\n".join(msg))
     entered = []
     deadline = now().replace(hour=10, minute=30, second=0, microsecond=0)
@@ -499,7 +538,7 @@ def breakout_entries(today, equity):
                 tg(f"ENTRY {label(t['sym'])} breakout at {q:.2f}: BUY {t['qty']} {t['occ']} @ {t['fill']:.2f} "
                    f"(${t['fill'] * 100 * t['qty']:,.0f}{', min-1-contract rule' if t.get('stretched') else ''}"
                    f"{'; ATM too expensive: ' + t['stepped'] if t.get('stepped') else ''}); "
-                   f"stop {t['stop']:.2f}, target {t['target']:.2f}; {pm_note(p, q)}")
+                   f"stop {t['stop']:.2f}, target {t['target']:.2f}; {pm_note(p, q)}; {level_note(p, q)}")
         manage_step([t for t in entered if "exit" not in t])
         time.sleep(5)
     if armed:
@@ -559,7 +598,8 @@ def main(phase):
                 f"submitted {o.get('submitted_at')} canceled {o.get('canceled_at')} cid {o.get('client_order_id')}")
         px = last_price(SYMS)
         for sym in SYMS:
-            log(f"PREMARKET {sym} {today}: high/low {premarket_levels(sym, today)}")
+            log(f"PREMARKET {sym} {today}: high/low {premarket_levels(sym, today)}; recent {recent_levels(sym, today)}")
+        log(f"VIX {vix_close()}")
         for p in option_positions():
             log(f"POSITION {p['symbol']} qty {p['qty']} avg {p['avg_entry_price']} now {p.get('current_price')} "
                 f"P&L {p.get('unrealized_pl')}")

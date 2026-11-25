@@ -147,6 +147,21 @@ def pick_contract(sym, cp, price, d: date):
     return None
 
 
+def cheaper_strikes(occ, sym, cp, price):
+    """Same expiry, strikes moving out of the money (calls up, puts down), nearest first, within 3% of price."""
+    exp = datetime.strptime(occ[len(occ) - 15:len(occ) - 9], "%y%m%d").date()
+    js = get(TRADE, "/v2/options/contracts", underlying_symbols=sym, expiration_date=exp.isoformat(),
+             type="call" if cp == "C" else "put", strike_price_gte=f"{price * 0.97:.2f}",
+             strike_price_lte=f"{price * 1.03:.2f}", limit=200)
+    cur = int(occ[-8:]) / 1000
+    cs = [c for c in js.get("option_contracts", []) if c.get("tradable", True)]
+    if cp == "C":
+        cs = sorted([c for c in cs if float(c["strike_price"]) > cur], key=lambda c: float(c["strike_price"]))
+    else:
+        cs = sorted([c for c in cs if float(c["strike_price"]) < cur], key=lambda c: -float(c["strike_price"]))
+    return [c["symbol"] for c in cs]
+
+
 def option_quote(occ):
     js = get(DATA, "/v1beta1/options/snapshots", symbols=occ, feed="indicative")
     q = ((js.get("snapshots") or {}).get(occ) or {}).get("latestQuote") or {}
@@ -290,11 +305,22 @@ def enter(plan, equity, d, dry=False, px=None):
         return {**plan, "skip": f"no quote for {occ}"}
     budget = RISK * equity
     qty = math.floor(budget / (ask * 100))
-    stretched = False
-    if qty < 1 and ask * 100 <= MIN_ONE_MULT * budget:
+    stretched, stepped = False, None
+    if qty < 1:  # too expensive: first step to the nearest strike out of the money that fits the budget
+        try:
+            for alt in cheaper_strikes(occ, sym, cp, px):
+                b2, a2 = option_quote(alt)
+                if a2 > 0 and math.floor(budget / (a2 * 100)) >= 1:
+                    stepped = f"{occ} cost ${ask * 100:,.0f}, used {alt}"
+                    occ, bid, ask = alt, b2, a2
+                    qty = math.floor(budget / (a2 * 100))
+                    break
+        except Exception as e:
+            log(f"strike step error {occ}: {e}")
+    if qty < 1 and ask * 100 <= MIN_ONE_MULT * budget:  # fallback: one contract of the original strike
         qty, stretched = 1, True
     info = {**plan, "entry_px": px, "target": target, "occ": occ, "bid": bid, "ask": ask, "qty": qty,
-            "premium": qty * ask * 100, "stretched": stretched}
+            "premium": qty * ask * 100, "stretched": stretched, "stepped": stepped}
     if qty < 1:
         return {**info, "skip": f"one contract costs ${ask * 100:,.0f}, more than {MIN_ONE_MULT:.1f}x the "
                                 f"{RISK:.0%} budget (${RISK * equity:,.0f})"}
@@ -439,7 +465,8 @@ def breakout_entries(today, equity):
             else:
                 entered.append(t)
                 tg(f"ENTRY {label(t['sym'])} breakout at {q:.2f}: BUY {t['qty']} {t['occ']} @ {t['fill']:.2f} "
-                   f"(${t['fill'] * 100 * t['qty']:,.0f}{', min-1-contract rule' if t.get('stretched') else ''}); "
+                   f"(${t['fill'] * 100 * t['qty']:,.0f}{', min-1-contract rule' if t.get('stretched') else ''}"
+                   f"{'; ATM too expensive: ' + t['stepped'] if t.get('stepped') else ''}); "
                    f"stop {t['stop']:.2f}, target {t['target']:.2f}")
         manage_step([t for t in entered if "exit" not in t])
         time.sleep(5)

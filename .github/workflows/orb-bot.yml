@@ -55,6 +55,9 @@ jobs:
           SHADOW_START: "2000"
           SHADOW_SINCE: "2026-11-25"
           MIN_ONE_MULT: "1.5"
+          SYMBOLS: "SPY,QQQ,IWM,NVDA,TSLA,MSFT"
+          EXPERIMENT_SYMBOLS: "NVDA,TSLA,MSFT"
+          DAILY_LOSS_LIMIT: "0.03"
           TIME_STOP_MIN: "90"
           ALPACA_KEY_ID: ${{ secrets.ALPACA_KEY_ID }}
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}

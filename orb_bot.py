@@ -28,7 +28,23 @@ from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 ET = ZoneInfo("America/New_York")
-SYMS = ["SPY", "QQQ", "IWM"]
+SYMS = [x.strip() for x in os.environ.get("SYMBOLS", "SPY,QQQ,IWM").split(",") if x.strip()]
+EXPERIMENT = {x.strip() for x in os.environ.get("EXPERIMENT_SYMBOLS", "").split(",") if x.strip()}
+DAILY_LOSS_LIMIT = float(os.environ.get("DAILY_LOSS_LIMIT", "0.03"))
+
+
+def label(sym):
+    return f"{sym} (experiment)" if sym in EXPERIMENT else sym
+
+
+def daily_loss_hit():
+    """Playbook rule 2: at -3% on the day, no new entries."""
+    try:
+        a = get(TRADE, "/v2/account")
+        eq, last = float(a["equity"]), float(a.get("last_equity") or a["equity"])
+        return last > 0 and (eq - last) / last <= -DAILY_LOSS_LIMIT, (eq - last) / last if last > 0 else 0.0
+    except Exception as e:
+        log(f"daily-loss check error: {e}"); return False, 0.0
 RISK = float(os.environ.get("RISK_PER_TRADE", "0.01"))
 # Optional virtual account: size trades as if the account held VIRTUAL_START dollars on VIRTUAL_SINCE,
 # plus the realized P&L of this bot's own trades since then. The real paper balance is ignored for sizing.
@@ -368,11 +384,11 @@ def manage_step(open_t):
                 o = sell_all(t["occ"], t["qty"], why.replace(" ", ""))
             except Exception as e:
                 log(f"sell error {t['occ']}: {e}")
-                tg(f"SELL FAILED {t['sym']} {t['occ']} ({why}): {e}. Retrying in 10 s.")
+                tg(f"SELL FAILED {label(t['sym'])} {t['occ']} ({why}): {e}. Retrying in 10 s.")
                 continue
             t["exit"] = float(o.get("filled_avg_price") or 0); t["why"] = why
             pnl = (t["exit"] - t["fill"]) * 100 * t["qty"]
-            tg(f"EXIT {t['sym']} {t['occ']} ({why} at {p:.2f})\nsold {t['qty']} @ {t['exit']:.2f}, "
+            tg(f"EXIT {label(t['sym'])} {t['occ']} ({why} at {p:.2f})\nsold {t['qty']} @ {t['exit']:.2f}, "
                f"bought @ {t['fill']:.2f}\nP&L ${pnl:,.0f} ({(t['exit'] / t['fill'] - 1):+.0%})")
 
 
@@ -382,7 +398,7 @@ def breakout_entries(today, equity):
     armed, msg = [], ["9:35 ET first candles (waiting for a breakout until 10:30 ET):"]
     for p in plan_today(today):
         if p.get("skip"):
-            msg.append(f"{p['sym']}: no trade ({p['skip']})"); continue
+            msg.append(f"{label(p['sym'])}: no trade ({p['skip']})"); continue
         b = p["candle"]
         p["level"] = b["h"] if p["side"] == 1 else b["l"]
         cp = "C" if p["side"] == 1 else "P"
@@ -394,7 +410,7 @@ def breakout_entries(today, equity):
         if not p["occ"]:
             msg.append(f"{p['sym']}: no contract found"); continue
         armed.append(p)
-        msg.append(f"{p['sym']}: {'CALL' if p['side'] == 1 else 'PUT'} {p['occ']} if it trades "
+        msg.append(f"{label(p['sym'])}: {'CALL' if p['side'] == 1 else 'PUT'} {p['occ']} if it trades "
                    f"{'above' if p['side'] == 1 else 'below'} {p['level']:.2f} (stop {p['stop']:.2f})")
     tg("\n".join(msg))
     entered = []
@@ -409,21 +425,26 @@ def breakout_entries(today, equity):
             if q is None or p["side"] * (q - p["level"]) <= 0:
                 continue
             armed.remove(p)
+            hit, dd = daily_loss_hit()
+            if hit:
+                tg(f"{label(p['sym'])} broke out at {q:.2f} but no trade: account is {dd:.1%} on the day "
+                   f"(daily loss limit {DAILY_LOSS_LIMIT:.0%})")
+                continue
             try:
                 t = enter(p, equity, today, px=q)
             except Exception as e:
                 t = {**p, "skip": f"error: {e}"}
             if t.get("skip"):
-                tg(f"{p['sym']} broke out at {q:.2f} but no trade: {t['skip']}")
+                tg(f"{label(p['sym'])} broke out at {q:.2f} but no trade: {t['skip']}")
             else:
                 entered.append(t)
-                tg(f"ENTRY {t['sym']} breakout at {q:.2f}: BUY {t['qty']} {t['occ']} @ {t['fill']:.2f} "
+                tg(f"ENTRY {label(t['sym'])} breakout at {q:.2f}: BUY {t['qty']} {t['occ']} @ {t['fill']:.2f} "
                    f"(${t['fill'] * 100 * t['qty']:,.0f}{', min-1-contract rule' if t.get('stretched') else ''}); "
                    f"stop {t['stop']:.2f}, target {t['target']:.2f}")
         manage_step([t for t in entered if "exit" not in t])
         time.sleep(5)
     if armed:
-        tg("No breakout by 10:30 ET, no trade: " + ", ".join(p["sym"] for p in armed))
+        tg("No breakout by 10:30 ET, no trade: " + ", ".join(label(p["sym"]) for p in armed))
 
 
 def rebuild_open():

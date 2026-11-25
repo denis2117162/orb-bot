@@ -155,7 +155,8 @@ def recent_levels(sym, d: date):
     """Prior-day and 5-day high/low from daily SIP bars ending yesterday (free: older than 15 min). Note only."""
     try:
         js = get(DATA, "/v2/stocks/bars", symbols=sym, timeframe="1Day", feed="sip", adjustment="split",
-                 start=(d - timedelta(days=14)).isoformat(), end=d.isoformat(), limit=20)
+                 start=(d - timedelta(days=14)).isoformat(),
+                 end=datetime(d.year, d.month, d.day, tzinfo=ET).isoformat(), limit=20)
         b = [x for x in (js.get("bars") or {}).get(sym) or [] if x["t"][:10] < d.isoformat()][-5:]
         if not b:
             return {}

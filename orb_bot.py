@@ -9,7 +9,8 @@ Phases (run by GitHub Actions on a schedule; times ET):
 Rules (playbook, paper only until the owner approves live trading):
 - First 5-minute candle (9:30-9:35 ET, IEX feed) closed up -> buy a call; down -> buy a put; flat -> no trade.
 - Strike nearest the price, expiry today (next listed expiry if none today).
-- Premium paid = 1% of equity per trade (playbook allows up to 2%; 1% chosen for paper start).
+- Premium paid = RISK_PER_TRADE of the sizing equity (virtual $10k at 3% from 2026-11-27, ETFs only).
+- Premarket high/low is noted on each trade (tracking only, not a rule).
 - Exit when the ETF hits the stop (far end of the first candle) or 10x the stop distance, else at 15:45 ET.
 - Kill switch: equity 15% below its high -> no new trades, alert.
 Keys come only from environment variables. Never printed.
@@ -37,12 +38,14 @@ def label(sym):
     return f"{sym} (experiment)" if sym in EXPERIMENT else sym
 
 
-def daily_loss_hit():
-    """Playbook rule 2: at -3% on the day, no new entries."""
+def daily_loss_hit(base=None):
+    """Playbook rule 2: at -3% on the day, no new entries. The day's P&L (only this bot trades the account) is
+    measured against `base` (the sizing equity, e.g. the virtual account) when given."""
     try:
         a = get(TRADE, "/v2/account")
         eq, last = float(a["equity"]), float(a.get("last_equity") or a["equity"])
-        return last > 0 and (eq - last) / last <= -DAILY_LOSS_LIMIT, (eq - last) / last if last > 0 else 0.0
+        ref = base or last
+        return ref > 0 and (eq - last) / ref <= -DAILY_LOSS_LIMIT, (eq - last) / ref if ref > 0 else 0.0
     except Exception as e:
         log(f"daily-loss check error: {e}"); return False, 0.0
 RISK = float(os.environ.get("RISK_PER_TRADE", "0.01"))
@@ -128,6 +131,33 @@ def first_candle(sym, d: date):
     bars = (js.get("bars") or {}).get(sym) or []
     b = [x for x in bars if datetime.fromisoformat(x["t"].replace("Z", "+00:00")).astimezone(ET) == st]
     return b[0] if b else None
+
+
+def premarket_levels(sym, d: date):
+    """High/low from 4:00 to 9:30 ET. SIP (free up to 15 min ago) plus IEX for the last minutes. Note only."""
+    st = datetime(d.year, d.month, d.day, 4, 0, tzinfo=ET); en = st.replace(hour=9, minute=30)
+    hs, ls = [], []
+    for feed, end in (("sip", min(en, now() - timedelta(minutes=16))), ("iex", en)):
+        if end <= st:
+            continue
+        try:
+            js = get(DATA, "/v2/stocks/bars", symbols=sym, timeframe="5Min", feed=feed,
+                     start=st.isoformat(), end=end.isoformat(), limit=200)
+            for x in (js.get("bars") or {}).get(sym) or []:
+                if datetime.fromisoformat(x["t"].replace("Z", "+00:00")).astimezone(ET) < en:
+                    hs.append(x["h"]); ls.append(x["l"])
+        except Exception as e:
+            log(f"premarket {sym} {feed}: {e}")
+    return (max(hs), min(ls)) if hs else (None, None)
+
+
+def pm_note(p, q):
+    """'past PM high' etc. for an entry at price q. Tracking only (pre-registered test PC failed 2025)."""
+    lvl = p.get("pmh") if p["side"] == 1 else p.get("pml")
+    if lvl is None:
+        return "PM level n/a"
+    past = p["side"] * (q - lvl) > 0
+    return f"{'past' if past else 'inside'} PM {'high' if p['side'] == 1 else 'low'} {lvl:.2f}"
 
 
 def last_price(syms):
@@ -427,6 +457,7 @@ def breakout_entries(today, equity):
             msg.append(f"{label(p['sym'])}: no trade ({p['skip']})"); continue
         b = p["candle"]
         p["level"] = b["h"] if p["side"] == 1 else b["l"]
+        p["pmh"], p["pml"] = premarket_levels(p["sym"], today)
         cp = "C" if p["side"] == 1 else "P"
         try:
             c = pick_contract(p["sym"], cp, float(b["c"]), today)
@@ -437,7 +468,8 @@ def breakout_entries(today, equity):
             msg.append(f"{p['sym']}: no contract found"); continue
         armed.append(p)
         msg.append(f"{label(p['sym'])}: {'CALL' if p['side'] == 1 else 'PUT'} {p['occ']} if it trades "
-                   f"{'above' if p['side'] == 1 else 'below'} {p['level']:.2f} (stop {p['stop']:.2f})")
+                   f"{'above' if p['side'] == 1 else 'below'} {p['level']:.2f} (stop {p['stop']:.2f}; "
+                   f"PM high {p['pmh'] or 0:.2f} / low {p['pml'] or 0:.2f})")
     tg("\n".join(msg))
     entered = []
     deadline = now().replace(hour=10, minute=30, second=0, microsecond=0)
@@ -451,7 +483,7 @@ def breakout_entries(today, equity):
             if q is None or p["side"] * (q - p["level"]) <= 0:
                 continue
             armed.remove(p)
-            hit, dd = daily_loss_hit()
+            hit, dd = daily_loss_hit(equity)
             if hit:
                 tg(f"{label(p['sym'])} broke out at {q:.2f} but no trade: account is {dd:.1%} on the day "
                    f"(daily loss limit {DAILY_LOSS_LIMIT:.0%})")
@@ -467,7 +499,7 @@ def breakout_entries(today, equity):
                 tg(f"ENTRY {label(t['sym'])} breakout at {q:.2f}: BUY {t['qty']} {t['occ']} @ {t['fill']:.2f} "
                    f"(${t['fill'] * 100 * t['qty']:,.0f}{', min-1-contract rule' if t.get('stretched') else ''}"
                    f"{'; ATM too expensive: ' + t['stepped'] if t.get('stepped') else ''}); "
-                   f"stop {t['stop']:.2f}, target {t['target']:.2f}")
+                   f"stop {t['stop']:.2f}, target {t['target']:.2f}; {pm_note(p, q)}")
         manage_step([t for t in entered if "exit" not in t])
         time.sleep(5)
     if armed:
@@ -526,6 +558,8 @@ def main(phase):
                 f"status {o['status']} filled {o.get('filled_qty')} @ {o.get('filled_avg_price')} "
                 f"submitted {o.get('submitted_at')} canceled {o.get('canceled_at')} cid {o.get('client_order_id')}")
         px = last_price(SYMS)
+        for sym in SYMS:
+            log(f"PREMARKET {sym} {today}: high/low {premarket_levels(sym, today)}")
         for p in option_positions():
             log(f"POSITION {p['symbol']} qty {p['qty']} avg {p['avg_entry_price']} now {p.get('current_price')} "
                 f"P&L {p.get('unrealized_pl')}")
